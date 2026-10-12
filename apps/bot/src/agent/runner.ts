@@ -6,6 +6,7 @@ import type {
 	LLMResponse,
 	LLMToolDefinition,
 	Logger,
+	ToolResult,
 	ToolUseBlock,
 	TriggerType,
 } from "@openviktor/shared";
@@ -41,6 +42,27 @@ const SEND_TOOL_NAMES = new Set([
 	"create_thread",
 ]);
 
+const BENCH_SLACK_MUTATIONS = new Set([
+	"coworker_slack_react",
+	"coworker_delete_slack_message",
+	"coworker_update_slack_message",
+	"coworker_upload_to_slack",
+	"coworker_join_slack_channels",
+	"coworker_open_slack_conversation",
+	"coworker_leave_slack_channels",
+	"coworker_invite_slack_user_to_team",
+	"coworker_report_issue",
+	"create_thread",
+	"send_message_to_thread",
+]);
+
+function suppressBenchSlackAction(name: string): boolean {
+	if (BENCH_SLACK_MUTATIONS.has(name)) return true;
+	if (!name.startsWith("mcp_pd_slack_")) return false;
+	const action = name.slice("mcp_pd_slack_".length);
+	return !/^(get|list|search|find|fetch|retrieve|lookup|read|history)_/.test(action);
+}
+
 const MAX_TOOL_OUTPUT_CHARS = 50_000;
 
 function truncateToolOutput(output: string): string {
@@ -72,6 +94,7 @@ export interface ApprovalGateConfig {
 
 export interface RunTrigger {
 	workspaceId: string;
+	allowedTools?: readonly string[];
 	memberId: string | null;
 	triggerType: TriggerType;
 	cronJobId?: string;
@@ -129,6 +152,7 @@ export class AgentRunner {
 		toolConfig?: ToolConfig,
 		orchestrator?: OrchestratorConfig,
 		approvalGate?: ApprovalGateConfig,
+		private createAccess?: (workspaceId: string) => { config: ToolConfig; dispose: () => void },
 	) {
 		this.toolConfig = toolConfig ?? null;
 		this.orchestrator = orchestrator ?? null;
@@ -163,7 +187,7 @@ export class AgentRunner {
 		return messages;
 	}
 
-	async run(trigger: RunTrigger, callbacks?: RunCallbacks): Promise<RunResult> {
+	async run(trigger: RunTrigger, callbacks?: RunCallbacks, scopedTools?: ToolConfig): Promise<RunResult> {
 		const startTime = Date.now();
 
 		const thread = await this.prisma.thread.upsert({
@@ -232,15 +256,24 @@ export class AgentRunner {
 			await transitionPhase(this.prisma, thread.id, ThreadPhase.REASONING);
 
 			const { messages, summaryUsage } = await this.buildMessages(thread, systemPrompt);
-			const executeResult = await this.execute(
-				agentRun.id,
-				thread.id,
-				messages,
-				trigger.model,
-				trigger.slackChannel,
-				trigger.slackThreadTs,
-				callbacks,
-			);
+			const access = scopedTools ? null : this.createAccess?.(trigger.workspaceId);
+			const executeResult = await (async () => {
+				try {
+					return await this.execute(
+						agentRun.id,
+						thread.id,
+						messages,
+						trigger.model,
+						trigger.slackChannel,
+						trigger.slackThreadTs,
+						callbacks,
+						trigger.allowedTools ? new Set(trigger.allowedTools) : undefined,
+						scopedTools ?? access?.config,
+					);
+				} finally {
+					access?.dispose();
+				}
+			})();
 
 			const inputTokens = executeResult.inputTokens + (summaryUsage?.inputTokens ?? 0);
 			const outputTokens = executeResult.outputTokens + (summaryUsage?.outputTokens ?? 0);
@@ -530,8 +563,10 @@ export class AgentRunner {
 		activeTools: LLMToolDefinition[],
 		loadedSkills: Set<string>,
 		hotLoadedTools: LLMToolDefinition[],
+		allowedTools?: ReadonlySet<string>,
 	): void {
 		for (const tool of hotLoadedTools) {
+			if (allowedTools && !allowedTools.has(tool.name)) continue;
 			if (loadedSkills.has(tool.name)) continue;
 			activeTools.push(tool);
 			loadedSkills.add(tool.name);
@@ -546,6 +581,8 @@ export class AgentRunner {
 		slackChannel?: string,
 		slackThreadTs?: string,
 		callbacks?: RunCallbacks,
+		allowedTools?: ReadonlySet<string>,
+		scopedTools?: ToolConfig,
 	): Promise<{
 		responseText: string;
 		messageSent: boolean;
@@ -558,7 +595,10 @@ export class AgentRunner {
 		let totalCostCents = 0;
 		let messageSent = false;
 
-		const activeTools = this.toolConfig ? [...this.toolConfig.tools] : [];
+		const activeConfig = scopedTools ?? this.toolConfig;
+		const activeTools = activeConfig ? activeConfig.tools.filter(
+			(tool) => !allowedTools || allowedTools.has(tool.name),
+		) : [];
 		const loadedSkills = new Set<string>();
 
 		for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -620,9 +660,11 @@ export class AgentRunner {
 				callbacks,
 				slackChannel,
 				slackThreadTs,
+				allowedTools,
+				activeConfig,
 			);
 			if (sentMessage) messageSent = true;
-			this.mergeHotLoadedTools(activeTools, loadedSkills, hotLoadedTools);
+			this.mergeHotLoadedTools(activeTools, loadedSkills, hotLoadedTools, allowedTools);
 
 			messages.push({ role: "user", content: toolResults });
 
@@ -663,6 +705,8 @@ export class AgentRunner {
 		callbacks?: RunCallbacks,
 		slackChannel?: string,
 		slackThreadTs?: string,
+		allowedTools?: ReadonlySet<string>,
+		activeConfig?: ToolConfig | null,
 	): Promise<{
 		toolResults: ContentBlock[];
 		sentMessage: boolean;
@@ -673,7 +717,7 @@ export class AgentRunner {
 		const hotLoadedTools: LLMToolDefinition[] = [];
 
 		for (const toolUse of toolUses) {
-			if (SEND_TOOL_NAMES.has(toolUse.name)) {
+			if (SEND_TOOL_NAMES.has(toolUse.name) && (!allowedTools || allowedTools.has(toolUse.name))) {
 				sentMessage = true;
 			}
 			callbacks?.onProgress?.({ phase: "tool_start", toolName: toolUse.name, round });
@@ -683,6 +727,8 @@ export class AgentRunner {
 				threadId,
 				slackChannel,
 				slackThreadTs,
+				allowedTools,
+				activeConfig,
 			);
 			callbacks?.onProgress?.({ phase: "tool_complete", toolName: toolUse.name, round });
 			toolResults.push(block);
@@ -751,6 +797,7 @@ export class AgentRunner {
 		toolUse: ToolUseBlock,
 		agentRunId: string,
 		permissionRequestId: string,
+		activeConfig: ToolConfig,
 	): Promise<{ block: ContentBlock; rawOutput: Record<string, unknown> | null }> {
 		const approvedInput = {
 			...toolUse.input,
@@ -758,7 +805,7 @@ export class AgentRunner {
 			_approvedRequestId: permissionRequestId,
 		};
 
-		const reResult = await this.toolConfig?.client.call(toolUse.name, approvedInput);
+		const reResult = await activeConfig.client.call(toolUse.name, approvedInput);
 		if (!reResult) {
 			return {
 				block: {
@@ -812,6 +859,7 @@ export class AgentRunner {
 		toolUse: ToolUseBlock,
 		agentRunId: string,
 		threadId: string,
+		activeConfig: ToolConfig,
 		slackChannel?: string,
 		slackThreadTs?: string,
 	): Promise<{ block: ContentBlock; rawOutput: Record<string, unknown> | null }> {
@@ -866,7 +914,7 @@ export class AgentRunner {
 				"Permission approved, re-executing tool",
 			);
 			await transitionPhase(this.prisma, threadId, ThreadPhase.TOOL_LOOP);
-			return this.reExecuteApprovedTool(toolUse, agentRunId, permissionRequestId);
+			return this.reExecuteApprovedTool(toolUse, agentRunId, permissionRequestId, activeConfig);
 		}
 
 		if (result.status === "rejected") {
@@ -908,8 +956,19 @@ export class AgentRunner {
 		threadId?: string,
 		slackChannel?: string,
 		slackThreadTs?: string,
+		allowedTools?: ReadonlySet<string>,
+		activeConfig?: ToolConfig | null,
 	): Promise<{ block: ContentBlock; rawOutput: Record<string, unknown> | null }> {
-		if (!this.toolConfig) {
+		if (allowedTools && !allowedTools.has(toolUse.name)) {
+			await this.persistToolCall(agentRunId, toolUse, "FAILED", 0, null, "Tool not permitted for this run");
+			return {
+				block: { type: "tool_result", tool_use_id: toolUse.id,
+					content: "Error: Tool not permitted for this run", is_error: true },
+				rawOutput: null,
+			};
+		}
+		const config = activeConfig ?? this.toolConfig;
+		if (!config) {
 			this.logger.warn(
 				{ tool: toolUse.name, agentRunId },
 				"Tool requested but no gateway configured",
@@ -933,17 +992,50 @@ export class AgentRunner {
 			};
 		}
 
-		const inputWithContext = { ...toolUse.input, _agentRunId: agentRunId };
+		const isBench = slackChannel === "__bench__";
+		const inputWithContext = {
+			...toolUse.input,
+			_agentRunId: agentRunId,
+			...(toolUse.name === "coworker_send_slack_message" ? { _bench: isBench } : {}),
+		};
 
 		this.logger.info({ tool: toolUse.name, agentRunId }, "Calling tool gateway");
-		const result = await this.toolConfig.client.call(toolUse.name, inputWithContext);
+		const result: ToolResult =
+			isBench && suppressBenchSlackAction(toolUse.name)
+				? {
+						output: { status: "suppressed", reason: "Slack action withheld in bench transport" },
+						durationMs: 0,
+					}
+				: await config.client.call(toolUse.name, inputWithContext);
 
 		if (result.output && isPermissionRequired(result.output)) {
+			if (allowedTools) {
+				await this.persistToolCall(agentRunId, toolUse, "FAILED", result.durationMs,
+					null, "Approval is unavailable for a scoped run");
+				return {
+					block: { type: "tool_result", tool_use_id: toolUse.id,
+						content: "Error: Approval is unavailable for this run", is_error: true },
+					rawOutput: null,
+				};
+			}
+			if (isBench) {
+				const { permissionRequestId, toolName } = result.output;
+				await this.prisma.permissionRequest.updateMany({
+					where: { id: permissionRequestId, status: "PENDING" },
+					data: { status: "APPROVED", approvedBy: "bench-owner", resolvedAt: new Date() },
+				});
+				this.logger.info(
+					{ agentRunId, permissionRequestId, tool: toolName },
+					"Bench owner approved tool",
+				);
+				return this.reExecuteApprovedTool(toolUse, agentRunId, permissionRequestId, config);
+			}
 			return this.handlePermissionGate(
 				result.output,
 				toolUse,
 				agentRunId,
 				threadId ?? "",
+				config,
 				slackChannel,
 				slackThreadTs,
 			);

@@ -11,6 +11,17 @@ function makeContext(overrides: Partial<PromptContext> = {}): PromptContext {
 }
 
 describe("buildSystemPrompt", () => {
+	it("returns A2A task results to the caller instead of trying Slack delivery", () => {
+		const prompt = buildSystemPrompt({
+			workspaceName: "Owner workspace",
+			channel: "__twin_owner__",
+			triggerType: "MANUAL",
+			a2aTask: true,
+		});
+		expect(prompt).toContain("A2A artifact");
+		expect(prompt).toContain("Return your result as the final assistant text");
+		expect(prompt).not.toContain("coworker_send_slack_message");
+	});
 	it("includes workspace name", () => {
 		const prompt = buildSystemPrompt(makeContext({ workspaceName: "Test Workspace" }));
 		expect(prompt).toContain('"Test Workspace"');

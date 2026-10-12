@@ -5,7 +5,7 @@
  * secrets (API keys, DB credentials) that can end up in tool output,
  * persisted to the database, and sent to LLM providers.
  */
-export function buildSandboxEnv(workspaceDir: string): NodeJS.ProcessEnv {
+export function buildSandboxEnv(workspaceDir: string, gatewayToken?: string): NodeJS.ProcessEnv {
 	return {
 		PATH: process.env.PATH,
 		HOME: workspaceDir,
@@ -17,6 +17,6 @@ export function buildSandboxEnv(workspaceDir: string): NodeJS.ProcessEnv {
 		TZ: process.env.TZ,
 		TOOL_GATEWAY_URL:
 			process.env.TOOL_GATEWAY_URL ?? `http://localhost:${process.env.TOOL_GATEWAY_PORT ?? "3001"}`,
-		TOOL_TOKEN: process.env.TOOL_TOKEN ?? "local",
+		TOOL_TOKEN: gatewayToken,
 	};
 }

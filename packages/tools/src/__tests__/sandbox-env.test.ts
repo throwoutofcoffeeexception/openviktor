@@ -6,6 +6,15 @@ function unsetEnv(key: string): void {
 }
 
 describe("buildSandboxEnv", () => {
+	it("passes only the current run token to SDK children instead of the shared local fallback", () => {
+		process.env.TOOL_TOKEN = "local";
+		try {
+			expect(buildSandboxEnv("/workspace", "scoped-run-token").TOOL_TOKEN).toBe("scoped-run-token");
+			expect(buildSandboxEnv("/workspace").TOOL_TOKEN).not.toBe("local");
+		} finally {
+			unsetEnv("TOOL_TOKEN");
+		}
+	});
 	it("includes only allowlisted environment variables", () => {
 		const env = buildSandboxEnv("/workspace");
 		const keys = Object.keys(env);

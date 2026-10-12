@@ -313,6 +313,108 @@ describe("AgentRunner", () => {
 		expect(toolResultMsg.content[0].is_error).toBeUndefined();
 	});
 
+	it("uses fresh scoped gateway access for each workspace and revokes after each run", async () => {
+		const accesses: Array<{ workspaceId: string; call: ReturnType<typeof vi.fn>; dispose: ReturnType<typeof vi.fn> }> = [];
+		const createAccess = vi.fn((workspaceId: string) => {
+			const access = { workspaceId, call: vi.fn().mockResolvedValue({ output: { workspaceId }, durationMs: 1 }),
+				dispose: vi.fn() };
+			accesses.push(access);
+			return { config: { client: { call: access.call } as never,
+				tools: [{ name: "read_learnings", description: "Read", input_schema: { type: "object" } }] },
+				dispose: access.dispose };
+		});
+		const sharedClient = { call: vi.fn() };
+		const toolRunner = new AgentRunner(prisma as never,
+			{ chat: mockChat, getModel: mockGetModel } as never, logger as never,
+			{ client: sharedClient as never, tools: [] }, undefined, undefined, createAccess);
+		const toolUse = makeResponse({ stopReason: "tool_use", content: [
+			{ type: "tool_use", id: "tool_1", name: "read_learnings", input: {} },
+		] });
+		mockChat.mockResolvedValueOnce(toolUse).mockResolvedValueOnce(makeResponse())
+			.mockResolvedValueOnce(toolUse).mockResolvedValueOnce(makeResponse());
+		await toolRunner.run(makeTrigger({ workspaceId: "workspace-a" }));
+		await toolRunner.run(makeTrigger({ workspaceId: "workspace-b" }));
+		expect(createAccess.mock.calls.map(([workspaceId]) => workspaceId)).toEqual(["workspace-a", "workspace-b"]);
+		expect(accesses.map(({ call }) => call.mock.calls.length)).toEqual([1, 1]);
+		expect(accesses.map(({ dispose }) => dispose.mock.calls.length)).toEqual([1, 1]);
+		expect(sharedClient.call).not.toHaveBeenCalled();
+	});
+
+	it("rejects a write tool even when the model asks for it during a scoped run", async () => {
+		const mockClient = { call: vi.fn().mockResolvedValue({ output: { status: "sent" }, durationMs: 1 }) };
+		const toolRunner = new AgentRunner(
+			prisma as never,
+			{ chat: mockChat, getModel: mockGetModel } as never,
+			logger as never,
+			{
+				client: mockClient as never,
+				tools: [
+					{ name: "read_learnings", description: "Read", input_schema: { type: "object" } },
+					{ name: "coworker_send_slack_message", description: "Send", input_schema: { type: "object" } },
+				],
+			},
+		);
+		mockChat.mockResolvedValueOnce(makeResponse({
+			stopReason: "tool_use",
+			content: [{ type: "tool_use", id: "tool_1", name: "coworker_send_slack_message", input: { text: "leak" } }],
+		})).mockResolvedValueOnce(makeResponse({ content: [{ type: "text", text: "Not sent" }] }));
+
+		const result = await toolRunner.run(makeTrigger({ allowedTools: ["read_learnings"] }));
+
+		expect(mockClient.call).not.toHaveBeenCalled();
+		expect(mockChat.mock.calls[0][1].tools).toEqual([
+			expect.objectContaining({ name: "read_learnings" }),
+		]);
+		expect(result.messageSent).toBe(false);
+		expect(result.responseText).toBe("Not sent");
+	});
+
+	it("uses a per-run gateway client instead of the shared workspace token", async () => {
+		const shared = { call: vi.fn().mockResolvedValue({ output: "wrong tenant", durationMs: 1 }) };
+		const scoped = { call: vi.fn().mockResolvedValue({ output: "owner tenant", durationMs: 1 }) };
+		const toolRunner = new AgentRunner(prisma as never,
+			{ chat: mockChat, getModel: mockGetModel } as never, logger as never,
+			{ client: shared as never, tools: [{ name: "read_learnings", description: "Read",
+				input_schema: { type: "object" } }] });
+		mockChat.mockResolvedValueOnce(makeResponse({ stopReason: "tool_use", content: [
+			{ type: "tool_use", id: "tool_1", name: "read_learnings", input: {} },
+		] })).mockResolvedValueOnce(makeResponse());
+
+		await toolRunner.run(makeTrigger({ allowedTools: ["read_learnings"] }), undefined,
+			{ client: scoped as never, tools: [{ name: "read_learnings", description: "Read",
+					input_schema: { type: "object" } }] });
+
+		expect(shared.call).not.toHaveBeenCalled();
+		expect(scoped.call).toHaveBeenCalledOnce();
+	});
+
+	it("does not forward a scoped run's permission request into Slack", async () => {
+		const scopedPrisma = makePrismaWithPermissions();
+		const slackPoster = { postMessage: vi.fn().mockResolvedValue("msg-1") };
+		scopedPrisma.permissionRequest.findUnique.mockResolvedValue({ status: "REJECTED" });
+		const mockClient = { call: vi.fn().mockResolvedValue({
+			output: { _permissionRequired: true, permissionRequestId: "p-1", toolName: "read_learnings" },
+			durationMs: 1,
+		}) };
+		const toolRunner = new AgentRunner(
+			scopedPrisma as never,
+			{ chat: mockChat, getModel: mockGetModel } as never,
+			logger as never,
+			{ client: mockClient as never,
+				tools: [{ name: "read_learnings", description: "Read", input_schema: { type: "object" } }] },
+			undefined,
+			{ slackPoster, buildPermissionMessage: () => ({ text: "Approve?", blocks: [] }), pollIntervalMs: 1 },
+		);
+		mockChat.mockResolvedValueOnce(makeResponse({ stopReason: "tool_use", content: [
+			{ type: "tool_use", id: "tool_1", name: "read_learnings", input: {} },
+		] })).mockResolvedValueOnce(makeResponse());
+
+		await toolRunner.run(makeTrigger({ allowedTools: ["read_learnings"] }));
+
+		expect(slackPoster.postMessage).not.toHaveBeenCalled();
+		expect(mockChat.mock.calls[1][0].at(-1).content[0].is_error).toBe(true);
+	});
+
 	it("handles tool gateway error and feeds error back to LLM", async () => {
 		const mockClient = {
 			call: vi.fn().mockResolvedValue({
@@ -800,6 +902,7 @@ describe("AgentRunner — Approval Gate", () => {
 
 	it("blocks on permission_required, posts Slack message, resumes on approval", async () => {
 		const gate = makeApprovalGate();
+		const sharedClient = { call: vi.fn() };
 		const mockClient = {
 			call: vi
 				.fn()
@@ -830,7 +933,7 @@ describe("AgentRunner — Approval Gate", () => {
 			{ chat: mockChat, getModel: mockGetModel } as never,
 			logger as never,
 			{
-				client: mockClient as never,
+				client: sharedClient as never,
 				tools: [
 					{
 						name: "mcp_pd_sheets_add_row",
@@ -841,6 +944,9 @@ describe("AgentRunner — Approval Gate", () => {
 			},
 			undefined,
 			gate,
+			() => ({ config: { client: mockClient as never,
+				tools: [{ name: "mcp_pd_sheets_add_row", description: "Add row",
+					input_schema: { type: "object" } }] }, dispose: vi.fn() }),
 		);
 
 		const toolUseResponse = makeResponse({
@@ -883,6 +989,7 @@ describe("AgentRunner — Approval Gate", () => {
 		);
 
 		expect(mockClient.call).toHaveBeenCalledTimes(2);
+		expect(sharedClient.call).not.toHaveBeenCalled();
 		expect(mockClient.call).toHaveBeenLastCalledWith("mcp_pd_sheets_add_row", {
 			data: "test",
 			_agentRunId: RUN_ID,

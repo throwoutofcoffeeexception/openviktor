@@ -5,6 +5,7 @@ export interface ToolExecutionContext {
 	workspaceId: string;
 	workspaceDir: string;
 	timeoutMs: number;
+	gatewayToken?: string;
 }
 
 export type ToolExecutor = (

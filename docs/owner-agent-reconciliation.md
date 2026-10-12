@@ -1,0 +1,9 @@
+# Owner agent request reconciliation
+
+`POST /v1/agent/run` reserves `(workspaceId, principalId, requestId)` before launching the runner. A duplicate POST returns 409 without starting another run. `GET` with the same grant and scope returns the completed receipt when it exists, 202 while a reservation is recent and has no receipt, or 409 `unknown_outcome` when it is older than 20 minutes. A 409 does **not** assert that the task failed: the process may have crashed after an external tool executed but before persisting a receipt.
+
+For `unknown_outcome`, the operator must reconcile the original `requestId` against the scoped thread, agent-run/tool-call records, and any external side effects. If delivery to the owner is relevant, verify that separately; `ownerDelivery: not_verified` is not an acknowledgement. Do not delete a reservation or automatically replay it. Only after the original task's outcome and effects are established may the owner explicitly authorize a new attempt under a **new** `requestId`; otherwise leave the old reservation in place and report the uncertain outcome.
+
+The gateway bearer for a normal agent run is minted per run, bound to its workspace and tool roles, expires after 20 minutes, and is revoked in `finally`. Owner-bridge calls are additionally restricted to `read_learnings` at the gateway, independently of the model tool list. Revoking or replacing the owner grant file takes effect on the next API request; the grant is not cached.
+
+Owner-agent mode requires `TOOL_BACKEND=local`: startup fails before database connection if the owner grant is configured with Modal. Modal's sandbox does not have a trusted route back to this gateway, so passing the bearer to Modal is not a supported workaround. Existing Modal installations without an owner-agent grant are unaffected.

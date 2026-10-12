@@ -2,6 +2,7 @@ import { createLogger } from "@openviktor/shared";
 import type { EnvConfig, Logger } from "@openviktor/shared";
 import { App, LogLevel } from "@slack/bolt";
 import type { Logger as SlackLogger } from "@slack/bolt";
+import { slackProxyAgent } from "./proxy.js";
 
 export function createSlackLoggerAdapter(pinoLogger: Logger): SlackLogger {
 	let currentLevel = LogLevel.INFO;
@@ -33,6 +34,7 @@ export function createSlackApp(config: EnvConfig): App {
 	const slackLogger = createSlackLoggerAdapter(pinoLogger);
 
 	return new App({
+		agent: slackProxyAgent(),
 		token: config.SLACK_BOT_TOKEN,
 		appToken: config.SLACK_APP_TOKEN,
 		signingSecret: config.SLACK_SIGNING_SECRET,

@@ -14,27 +14,41 @@ interface GatewayDeps {
 	defaultTimeoutMs: number;
 }
 
-const TOKEN_WORKSPACE_MAP = new Map<string, string>();
+const TOKEN_WORKSPACE_MAP = new Map<string, {
+	workspaceId: string;
+	allowedRoles: ReadonlySet<string>;
+	expiresAt: number;
+}>();
 
-export function registerWorkspaceToken(token: string, workspaceId: string): void {
-	TOKEN_WORKSPACE_MAP.set(token, workspaceId);
+export function registerWorkspaceToken(token: string, workspaceId: string,
+	allowedRoles: readonly string[], expiresAt: number): void {
+	if (!/^[a-f0-9]{64}$/.test(token) || !workspaceId || TOKEN_WORKSPACE_MAP.has(token)
+		|| !allowedRoles.length || !Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) {
+		throw new Error("Invalid or previously registered gateway token");
+	}
+	TOKEN_WORKSPACE_MAP.set(token, { workspaceId, allowedRoles: new Set(allowedRoles), expiresAt });
+}
+
+export function revokeWorkspaceToken(token: string): void {
+	TOKEN_WORKSPACE_MAP.delete(token);
 }
 
 export function resolveWorkspaceFromToken(token: string): string | null {
-	return TOKEN_WORKSPACE_MAP.get(token) ?? null;
+	const binding = TOKEN_WORKSPACE_MAP.get(token);
+	return binding && binding.expiresAt > Date.now() ? binding.workspaceId : null;
 }
 
-function validateAuth(req: Request): string | Response {
+function validateAuth(req: Request, role: string): { workspaceId: string; token: string } | Response {
 	const authHeader = req.headers.get("authorization");
 	if (!authHeader?.startsWith("Bearer ")) {
 		return Response.json({ error: "Unauthorized" }, { status: 401 });
 	}
 	const token = authHeader.slice(7);
-	const workspaceId = resolveWorkspaceFromToken(token);
-	if (!workspaceId) {
+	const binding = TOKEN_WORKSPACE_MAP.get(token);
+	if (!binding || binding.expiresAt <= Date.now() || !binding.allowedRoles.has(role)) {
 		return Response.json({ error: "Invalid token" }, { status: 403 });
 	}
-	return workspaceId;
+	return { workspaceId: binding.workspaceId, token };
 }
 
 async function parseBody(req: Request): Promise<GatewayRequest | Response> {
@@ -62,7 +76,8 @@ export function createToolGateway(deps: GatewayDeps): {
 } {
 	const { registry, backend, logger, defaultTimeoutMs } = deps;
 
-	async function handleToolCall(workspaceId: string, body: GatewayRequest): Promise<Response> {
+	async function handleToolCall(identity: { workspaceId: string; token: string }, body: GatewayRequest): Promise<Response> {
+		const { workspaceId } = identity;
 		if (!body.role || typeof body.role !== "string") {
 			return Response.json({ error: "Missing or invalid 'role' field" }, { status: 400 });
 		}
@@ -73,7 +88,8 @@ export function createToolGateway(deps: GatewayDeps): {
 		}
 
 		const workspaceDir = await ensureWorkspace(workspaceId);
-		const ctx: ToolExecutionContext = { workspaceId, workspaceDir, timeoutMs: defaultTimeoutMs };
+		const ctx: ToolExecutionContext = { workspaceId, workspaceDir, timeoutMs: defaultTimeoutMs,
+			gatewayToken: identity.token };
 
 		logger.info({ tool: body.role, workspaceId }, "Tool call started");
 		const start = Date.now();
@@ -107,11 +123,10 @@ export function createToolGateway(deps: GatewayDeps): {
 				return Response.json({ error: "Not found" }, { status: 404 });
 			}
 
-			const authResult = validateAuth(req);
-			if (authResult instanceof Response) return authResult;
-
 			const bodyResult = await parseBody(req);
 			if (bodyResult instanceof Response) return bodyResult;
+			const authResult = validateAuth(req, bodyResult.role);
+			if (authResult instanceof Response) return authResult;
 
 			return handleToolCall(authResult, bodyResult);
 		},

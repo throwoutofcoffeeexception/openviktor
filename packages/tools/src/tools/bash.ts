@@ -37,7 +37,7 @@ export const bashExecutor: ToolExecutor = async (args, ctx) => {
 			cwd: ctx.workspaceDir,
 			timeout: timeoutMs,
 			env: {
-				...buildSandboxEnv(ctx.workspaceDir),
+				...buildSandboxEnv(ctx.workspaceDir, ctx.gatewayToken),
 				PYTHONPATH: ctx.workspaceDir,
 			},
 			stdio: ["ignore", "pipe", "pipe"],

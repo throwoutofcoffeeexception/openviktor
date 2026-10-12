@@ -4,6 +4,7 @@ import { decrypt, isManaged, isSelfHosted } from "@openviktor/shared";
 import { App } from "@slack/bolt";
 import { WebClient } from "@slack/web-api";
 import { createSlackLoggerAdapter } from "./app.js";
+import { slackProxyAgent } from "./proxy.js";
 
 export interface SlackConnection {
 	workspaceId: string;
@@ -68,6 +69,7 @@ export class SocketModeConnection implements SlackConnection {
 		this.botUserId = botUserId;
 
 		this.app = new App({
+			agent: slackProxyAgent(),
 			token: botToken,
 			appToken,
 			signingSecret,

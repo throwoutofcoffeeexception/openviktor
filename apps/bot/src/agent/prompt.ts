@@ -25,6 +25,7 @@ export interface PromptContext {
 	threadPath?: string;
 	onboardingPrompt?: string;
 	channelIntroPrompt?: string;
+	a2aTask?: boolean;
 }
 
 function triggerLabel(triggerType: TriggerType): string {
@@ -58,6 +59,17 @@ function buildSpecializedPrompt(name: string, prompt: string, preamble?: string)
 }
 
 function resolveSpecializedPrompt(ctx: PromptContext): string | null {
+	if (ctx.a2aTask) {
+		return [
+			`You are OpenViktor, an AI coworker in the "${ctx.workspaceName}" workspace.`,
+			"You are executing an owner-scoped task received over A2A.",
+			"Call `read_learnings` first, then use only the allowed workspace tools needed for the task.",
+			"Return your result as the final assistant text; the A2A gateway stores that text in the Task A2A artifact.",
+			"Do not call Slack messaging or reaction tools and do not try to send the result to OpenViktor or to yourself.",
+			"If the task cannot be completed, return the exact reason or missing input in the final assistant text.",
+			...buildErrorRules(),
+		].join("\n");
+	}
 	if (ctx.onboardingPrompt) {
 		return buildSpecializedPrompt(
 			ctx.workspaceName,
